@@ -1,29 +1,145 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Dobby - AI Movie Assistant</title>
-  <style>
-    body { font-family: Arial, sans-serif; background:#111; color:#eee; margin:0; }
-    #chat { height: 90vh; overflow-y: auto; padding: 20px; }
-    .msg { margin-bottom: 12px; max-width: 70%; }
-    .user { text-align: right; color:#00d9ff; }
-    .bot { text-align: left; color:#ffd35a; }
-    #input-box { position: fixed; bottom: 0; width: 100%; display:flex; }
-    #txt { flex:1; padding:12px; font-size:18px; border:none; outline:none; }
-    #send { width:120px; background:#00d9ff; border:none; font-size:18px; cursor:pointer; }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Dobby — Smart Movie Assistant</title>
+<style>
+  body{margin:0;background:#000;color:#fff;font-family:Arial,system-ui;}
+  #app{max-width:900px;margin:0 auto;padding:20px}
+  #chat{border:1px solid #333;border-radius:10px;padding:10px;height:300px;overflow-y:auto;background:#111}
+  #results{margin-top:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+  .movie{background:#1c1c1c;border-radius:8px;overflow:hidden}
+  .movie img{width:100%;height:240px;object-fit:cover}
+  .movie div{padding:8px;font-size:.9rem}
+  input,button{padding:10px;border-radius:8px;border:none}
+  #inputRow{display:flex;gap:8px;margin-top:12px}
+  button{background:#00ffc8;font-weight:bold;cursor:pointer}
+</style>
 </head>
 <body>
+<div id="app">
+
+<h2>Dobby — Your AI Movie Assistant 🎬</h2>
 
 <div id="chat"></div>
 
-<div id="input-box">
-  <input id="txt" placeholder="Ask something... (ex: best korean action movies)" autocomplete="off"/>
-  <button id="send">Send</button>
+<div id="inputRow">
+  <input id="userInput" placeholder="Ask e.g. 'best korean action 2018 8+'">
+  <button id="send">Ask</button>
 </div>
 
-<script src="script.js"></script>
+<div id="results"></div>
 
+</div>
+
+<script>
+// ====== CONFIG ======
+const FIREWORKS_KEY   = "fw_3ZGLzhbzx5RjAdU8mNQt4ZNb";       // ← استبدل لو حبيت
+const FIREWORKS_MODEL = "accounts/fireworks/models/llama-v3p1-70b-instruct";
+const RAPID_KEY       = "09b4e8b9cbmsh354855aa8e8815dp1cf5dejsn5899f4db146f";
+const RAPID_HOST      = "imdb236.p.rapidapi.com";
+
+// ====== STATE ======
+let CATALOG = [];
+let RANK_CACHE = {};
+
+// ====== UI ======
+function chat(role, text){
+  const box = document.getElementById("chat");
+  box.innerHTML += `<p><b>${role}:</b> ${text}</p>`;
+  box.scrollTop = box.scrollHeight;
+}
+function showMovies(list){
+  const box = document.getElementById("results");
+  box.innerHTML = "";
+  list.slice(0,10).forEach(m=>{
+    box.innerHTML += `
+      <div class="movie">
+        <img src="${m.primaryImage||''}">
+        <div>${m.primaryTitle||m.title||''}<br>⭐ ${m.averageRating||"N/A"}</div>
+      </div>
+    `;
+  });
+}
+
+// ====== LOAD CATALOG ======
+(async ()=>{
+  const res = await fetch("/catalog.json");
+  CATALOG = await res.json();
+  chat("Dobby","✅ Catalog loaded ("+CATALOG.length+" movies). Ask me anything!");
+})();
+
+// ====== LLM ======
+async function llm(messages){
+  const r = await fetch("https://api.fireworks.ai/inference/v1/chat/completions",{
+    method:"POST",
+    headers:{
+      "Authorization":`Bearer ${FIREWORKS_KEY}`,
+      "Content-Type":"application/json"
+    },
+    body:JSON.stringify({model:FIREWORKS_MODEL,messages,temperature:0.2})
+  });
+  return (await r.json()).choices[0].message.content;
+}
+
+// ====== AI ANALYSIS ======
+async function analyze(q){
+return JSON.parse(
+  (await llm([
+    {role:"system",content:`Return only JSON: { genre, language, year_after, min_rating, theme, summary }`},
+    {role:"user",content:q}
+  ]))
+  .replace(/```/g,"")
+);
+}
+
+// ====== AI RANK ======
+async function rank(list, query){
+  if(RANK_CACHE[query]) return RANK_CACHE[query];
+  const compact=list.slice(0,60).map(m=>({id:m.id,title:m.primaryTitle,overview:m.description||""}));
+  let scored = await llm([
+    {role:"system",content:`Return ONLY JSON ranking: [{"id":"tt123","score":90}]`},
+    {role:"user",content:`Rank relevance for: "${query}"\nMovies: ${JSON.stringify(compact)}`}
+  ]);
+  scored = JSON.parse(scored.replace(/```/g,""));
+  const map=new Map(scored.map(s=>[s.id,s.score]));
+  const ranked = list.map(m=>({...m,_score:map.get(m.id)||0})).sort((a,b)=>b._score-a._score);
+  RANK_CACHE[query]=ranked;
+  return ranked;
+}
+
+// ====== SEARCH ======
+function filter(list,f){
+  return list.filter(m=>{
+    if(f.genre && !(m.genres||[]).join().toLowerCase().includes(f.genre.toLowerCase())) return false;
+    if(f.language && !(m.spokenLanguages||[]).join().toLowerCase().includes(f.language.toLowerCase())) return false;
+    if(f.year_after && (m.startYear||0) < f.year_after) return false;
+    if(f.min_rating && (m.averageRating||0) < f.min_rating) return false;
+    return true;
+  });
+}
+
+// ====== MAIN ======
+async function ask(){
+  const q=document.getElementById("userInput").value.trim();
+  if(!q) return;
+  chat("You",q);
+
+  const f = await analyze(q);
+  chat("Dobby","🔍 "+f.summary);
+
+  let pool = filter(CATALOG,f);
+  if(pool.length===0){ chat("Dobby","🚫 No results"); return; }
+
+  let ranked = await rank(pool,q);
+
+  showMovies(ranked);
+  chat("Dobby","✅ Done ("+ranked.length+" found).");
+}
+
+document.getElementById("send").onclick = ask;
+document.getElementById("userInput").onkeydown = (e)=>{if(e.key==="Enter")ask()};
+</script>
 </body>
 </html>
